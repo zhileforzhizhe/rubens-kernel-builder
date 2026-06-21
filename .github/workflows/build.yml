@@ -1,0 +1,183 @@
+name: Build rubens DroidSpaces Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq flex bison bc libelf-dev libssl-dev lz4 xz-utils cpio
+
+      - name: Clone rubens kernel source
+        run: |
+          git clone --depth 1 --single-branch --branch rubens-s-oss \
+            https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-5.10
+
+      - name: Clone MTK kernel modules
+        run: |
+          git clone --depth 1 --single-branch --branch rubens-s-oss \
+            https://github.com/MiCode/MTK_kernel_modules.git vendor-mtk
+
+      - name: Apply DroidSpaces ABI patches
+        run: |
+          cd kernel-5.10
+
+          patch -p1 << 'PATCH1'
+          --- a/include/linux/sched.h
+          +++ b/include/linux/sched.h
+          @@ -973,8 +973,8 @@ struct task_struct {
+           	struct nameidata		*nameidata;
+
+           #ifdef CONFIG_SYSVIPC
+          -	struct sysv_sem			sysvsem;
+          -	struct sysv_shm			sysvshm;
+          +	// struct sysv_sem			sysvsem;
+          +	// struct sysv_shm			sysvshm;
+           #endif
+           #ifdef CONFIG_DETECT_HUNG_TASK
+           	unsigned long			last_switch_count;
+          @@ -1384,9 +1384,15 @@ struct task_struct {
+           	ANDROID_KABI_RESERVE(3);
+           	ANDROID_KABI_RESERVE(4);
+           	ANDROID_KABI_RESERVE(5);
+          +
+          +#ifdef CONFIG_SYSVIPC
+          +	ANDROID_KABI_USE(6, struct sysv_sem sysvsem);
+          +	_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);
+          +#else
+           	ANDROID_KABI_RESERVE(6);
+           	ANDROID_KABI_RESERVE(7);
+           	ANDROID_KABI_RESERVE(8);
+          +#endif
+
+           	/*
+           	 * New fields for task_struct should be added above here, so that
+          PATCH1
+
+          patch -p1 << 'PATCH2'
+          --- a/include/linux/sched/user.h
+          +++ b/include/linux/sched/user.h
+          @@ -23,7 +23,7 @@ struct user_struct {
+           #endif
+           #ifdef CONFIG_POSIX_MQUEUE
+           	/* protected by mq_lock	*/
+          -	unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
+          +	//unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
+           #endif
+           	unsigned long locked_shm; /* How many pages of mlocked shm ? */
+           	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
+          @@ -44,9 +44,15 @@ struct user_struct {
+           	/* Miscellaneous per-user rate limit */
+           	struct ratelimit_state ratelimit;
+
+          +#if defined(CONFIG_POSIX_MQUEUE)
+          +	ANDROID_KABI_USE(1, unsigned long mq_bytes);
+          +	ANDROID_KABI_RESERVE(2);
+          +	ANDROID_OEM_DATA_ARRAY(1, 2);
+          +#else
+           	ANDROID_KABI_RESERVE(1);
+           	ANDROID_KABI_RESERVE(2);
+           	ANDROID_OEM_DATA_ARRAY(1, 2);
+          +#endif
+           };
+           extern int uids_sysfs_init(void);
+          PATCH2
+
+      - name: Add DroidSpaces configs to rubens defconfig
+        run: |
+          cd kernel-5.10
+          cat >> arch/arm64/configs/mikrn_rubens_defconfig << 'EOF'
+
+          # DroidSpaces container support
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_PID_NS=y
+          CONFIG_IPC_NS=y
+          CONFIG_USER_NS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_TMPFS_XATTR=y
+          EOF
+
+      - name: Set up Android Clang toolchain
+        run: |
+          mkdir -p prebuilts-master/clang/host/linux-x86
+          cd prebuilts-master/clang/host/linux-x86
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r416183b.tar.gz" -O clang-r416183b.tar.gz
+          mkdir -p clang-r416183b
+          tar xf clang-r416183b.tar.gz -C clang-r416183b
+          rm clang-r416183b.tar.gz
+          echo "Clang version:"
+          clang-r416183b/bin/clang --version 2>/dev/null || echo "using fallback..."
+          # Fallback: use system clang + lld
+          sudo apt-get install -y -qq clang llvm lld || true
+
+      - name: Build kernel
+        run: |
+          cd kernel-5.10
+          export PATH="$GITHUB_WORKSPACE/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
+
+          mkdir -p out
+
+          # Merge GKI + rubens defconfig
+          ARCH=arm64 scripts/kconfig/merge_config.sh -O out \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/mikrn_rubens_defconfig
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -5
+
+          echo ""
+          echo "=== Verifying DroidSpaces configs ==="
+          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|USER_NS|DEVTMPFS|CGROUP_DEVICE|CGROUP_PIDS|TMPFS_XATTR)" out/.config || true
+
+          echo ""
+          echo "=== Building vmlinux + modules ==="
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image modules -j$(nproc) 2>&1 | tail -20
+
+          echo ""
+          echo "=== Verifying Image exists ==="
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Create AnyKernel3 package
+        run: |
+          mkdir -p ak3/modules
+
+          # Kernel image (gzip for AK3)
+          gzip -9 -c kernel-5.10/out/arch/arm64/boot/Image > ak3/Image.gz
+
+          # Modules
+          find kernel-5.10/out -name "*.ko" ! -path "*/modules.*" -exec cp {} ak3/modules/ \; 2>/dev/null || true
+          wc -l < <(ls ak3/modules/*.ko 2>/dev/null) && echo "modules found" || echo "no modules in out"
+          cp build-tools/path/linux-x86/depmod ak3/ 2>/dev/null || cp /sbin/depmod ak3/ 2>/dev/null || true
+
+          # anykernel.sh
+          cat > ak3/anykernel.sh << 'EOF'
+          # DroidSpaces kernel for Redmi K50 (rubens) MTK
+          device.name1=rubens
+          device.name2=rubens
+          block=/dev/block/by-name/boot
+          is_slot_device=1
+          ramdisk_compression=auto
+          do.modules=1
+          do.ramdisk=1
+          do.ramdisk.repack=1
+          kernel.string=Image.gz
+          EOF
+
+          cd ak3
+          zip -r9 ../rubens-droidspaces-kernel-$(date +%Y%m%d).zip .
+          cd ..
+          ls -lh rubens-droidspaces-kernel-*.zip
+
+      - name: Upload AK3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubens-droidspaces-kernel
+          path: rubens-droidspaces-kernel-*.zip
