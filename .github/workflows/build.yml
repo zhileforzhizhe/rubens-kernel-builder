@@ -5,19 +5,25 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
     steps:
       - name: Install deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq flex bison bc libelf-dev libssl-dev lz4 xz-utils cpio git curl
+        run: >
+          sudo apt-get update -qq &&
+          sudo apt-get install -y -qq flex bison bc libelf-dev libssl-dev
+          lz4 xz-utils cpio git curl llvm lld clang binutils-aarch64-linux-gnu
 
-      - name: Clone rubens kernel (MI official)
-        run: git clone --depth 1 --single-branch --branch rubens-s-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-5.10
+      - name: Clone rubens kernel
+        run: |
+          git clone --depth 1 --single-branch --branch rubens-s-oss \
+            https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-5.10
 
-      - name: Clone MTK vendor modules (MI official)
-        run: git clone --depth 1 --single-branch --branch rubens-s-oss https://github.com/MiCode/MTK_kernel_modules.git kernel-5.10/vendor/mediatek/kernel_modules
+      - name: Clone MTK vendor modules
+        run: |
+          git clone --depth 1 --single-branch --branch rubens-s-oss \
+            https://github.com/MiCode/MTK_kernel_modules.git \
+            kernel-5.10/vendor/mediatek/kernel_modules
 
       - name: Apply DroidSpaces ABI patches
         working-directory: kernel-5.10
@@ -55,8 +61,6 @@ jobs:
  	/*
  	 * New fields for task_struct should be added above here, so that
 P1
-          else
-            echo "SYSVIPC patch already applied"
           fi
 
           if ! grep -q "ANDROID_KABI_USE(1, unsigned long mq_bytes)" include/linux/sched/user.h 2>/dev/null; then
@@ -89,8 +93,6 @@ P1
  };
  extern int uids_sysfs_init(void);
 P2
-          else
-            echo "POSIX_MQUEUE patch already applied"
           fi
 
       - name: Add DroidSpaces configs
@@ -110,37 +112,12 @@ CONFIG_CGROUP_DEVICE=y
 CONFIG_CGROUP_PIDS=y
 CONFIG_TMPFS_XATTR=y
 EOCFG
-            echo "Configs added"
-          else
-            echo "Configs already present"
           fi
 
-      - name: Setup toolchain + Build
+      - name: Build kernel
         working-directory: kernel-5.10
         run: |
-          # --- Toolchain ---
-          # Try Google's prebuilt, fallback to system clang
-          mkdir -p prebuilts-master/clang/host/linux-x86
-          cd prebuilts-master/clang/host/linux-x86
-
-          CLANG_OK=0
-          wget --timeout=30 -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz" -O clang.tar.gz 2>/dev/null && \
-            mkdir -p clang-r416183b && tar xf clang.tar.gz -C clang-r416183b/ 2>/dev/null && \
-            file clang-r416183b/bin/clang 2>/dev/null | grep -q ELF && CLANG_OK=1
-
-          if [ "$CLANG_OK" = "1" ]; then
-            export CLANG_DIR="$PWD/clang-r416183b/bin"
-            echo "Using Google clang-r416183b"
-          else
-            sudo apt-get install -y -qq clang-14 lld-14 llvm-14 || sudo apt-get install -y -qq clang lld
-            export CLANG_DIR="/usr/bin"
-            echo "Using system clang + lld"
-          fi
-
-          cd "$GITHUB_WORKSPACE/kernel-5.10"
-          export PATH="$CLANG_DIR:$PATH"
-
-          # --- Merge defconfigs ---
+          set -e
           mkdir -p out
           ARCH=arm64 scripts/kconfig/merge_config.sh -O out \
             arch/arm64/configs/gki_defconfig \
@@ -149,16 +126,13 @@ EOCFG
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -5
 
           echo ""
-          echo "=== Checking DroidSpaces configs ==="
+          echo "=== DroidSpaces configs ==="
           grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|USER_NS|DEVTMPFS|CGROUP_DEVICE|CGROUP_PIDS|TMPFS_XATTR)" out/.config
 
           echo ""
           echo "=== Building Image + modules ==="
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image modules -j$(nproc) 2>&1 | tail -30
-          echo "BUILD_EXIT_CODE=$?"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image modules -j$(nproc) 2>&1 | tail -20
 
-          echo ""
-          echo "=== Output ==="
           ls -lh out/arch/arm64/boot/Image
 
       - name: Package AnyKernel3
@@ -169,21 +143,20 @@ EOCFG
           echo "Module count: $(ls ak3/modules/*.ko 2>/dev/null | wc -l)"
 
           cat > ak3/anykernel.sh << 'EOF'
-# DroidSpaces kernel for Redmi K50 (rubens)
-device.name1=rubens
-device.name2=rubens
-block=/dev/block/by-name/boot
-is_slot_device=1
-ramdisk_compression=auto
-do.modules=1
-do.ramdisk=1
-do.ramdisk.repack=1
-kernel.string=Image.gz
-EOF
+          # DroidSpaces kernel for Redmi K50 (rubens)
+          device.name1=rubens
+          device.name2=rubens
+          block=/dev/block/by-name/boot
+          is_slot_device=1
+          ramdisk_compression=auto
+          do.modules=1
+          do.ramdisk=1
+          do.ramdisk.repack=1
+          kernel.string=Image.gz
+          EOF
 
           cd ak3 && zip -r9 ../rubens-droidspaces-kernel-$(date +%Y%m%d).zip .
           ls -lh ../rubens-droidspaces-kernel-*.zip
-          echo "ZIP_NAME=$(basename ../rubens-droidspaces-kernel-*.zip)" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
